@@ -341,6 +341,9 @@ class DiscreteMIP(object):
 
 		x = dict()  # mip variables
 		cons = list()  # log of constraints for debugging
+		
+		ra_to_tasks = S.resources_req_tasks()
+		
 		for T in self.task_groups:
 			task_group_size = len(self.task_groups[T])
 			# base time-indexed variables
@@ -362,29 +365,40 @@ class DiscreteMIP(object):
 				x.update({ (T,R,t) : mip.var(str((T, R, t)), 0, task_group_size, cat)
 				           for R in RA for t in range(self.horizon) if (T,R,t) not in x})
 				# enough position needs to get selected
-				affine = [(x[T, R, t], 1) for R in RA for t in range(self.horizon) ]
+				# affine = [(x[T, R, t], 1) for R in RA for t in range(self.horizon) ]
 				# TODO: can the next line be removed?
 				# cons.append(mip.con(affine, sense=0, rhs=task_group_size))
 				# synchronize with base variables
 				for t in range(self.horizon):
 					affine = [(x[T, R, t], 1) for R in RA] + [(x[T,t],-1)]
 					cons.append(mip.con(affine, sense=0, rhs=0))
+				
+				# check if group requires the same resource
+				# if yes, introduce new variable (T,R)
+				if (len(set(ra_to_tasks[RA]) & set(self.task_groups[T])) == task_group_size):
+					# TODO: assume it's impossible that part of tasks require the same resource. OK?
+					for R in RA:
+						if (T,R) not in x:
+							x.update({(T,R) : mip.var(str((T, R)), 0, 1, 'Binary')})
+						affine = [(x[T, R, t], 1) for t in range(self.horizon) ] + [(x[T,R], -task_group_size)]
+						cons.append(mip.con(affine, sense=0, rhs=0))
 
 			# generate shortcuts for single resources
 			x.update({ (T,R,t) : x[T,t] for RA in T.resources_req if len(RA) == 1
 					   for R in RA for t in range(self.horizon) })
 
 		# synchronize in RA with multiple tasks
-		ra_to_tasks = S.resources_req_tasks()
 		for RA in ra_to_tasks:
 			tasks = list(set(ra_to_tasks[RA]) & set(self.task_groups))
 			if not tasks:
 				continue
+			T_ = tasks[0]
+			task_group_size_T_ = len(self.task_groups[T_])
 			for R in RA:
-				T_ = tasks[0]
 				for T in tasks[1:]:
-					affine = [(x[T,R,t],1) for t in range(self.horizon) ]+\
-							 [(x[T_,R,t],-1) for t in range(self.horizon) ]
+					task_group_size_T = len(self.task_groups[T])
+					affine = [(x[T,R,t],1/task_group_size_T) for t in range(self.horizon) ]+\
+							 [(x[T_,R,t],-1/task_group_size_T_) for t in range(self.horizon) ]
 					cons.append(mip.con(affine, sense=0, rhs=0))
 
 		# everybody is finished before the horizon TODO: why is this check necessary
