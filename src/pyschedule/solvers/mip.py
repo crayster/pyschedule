@@ -72,6 +72,26 @@ def solve(scenario, kind='CBC', time_limit=None, random_seed=None, ratio_gap=0.0
 	mip = MIP(str(scenario))
 	return DiscreteMIP(mip).solve(scenario, kind=kind, time_limit=time_limit, random_seed=random_seed, ratio_gap=ratio_gap, msg=msg)
 
+def solve2(scenario, kind='CBC', time_limit=None, random_seed=None, ratio_gap=0.0, msg=0, holidays=None):
+	"""
+	Solves the given scenario using a discrete MIP
+
+	Args:
+		scenario:            scenario to solve
+		kind:                MIP-solver to use: CPLEX, GLPK, CBC
+		time_limit:          a time limit, only for CPLEX and CBC
+		random_seed:         random seed
+		ratio_gap:           MIP-gap
+		msg:                 0 means no feedback (default) during computation, 1 means feedback
+
+	Returns:
+		1 if solving was successful
+		0 if solving was not successful
+	"""
+	scenario.check()
+	mip = MIP(str(scenario))
+	return DiscreteMIP2(mip).solve(scenario, kind=kind, time_limit=time_limit, random_seed=random_seed, ratio_gap=ratio_gap, msg=msg, holidays=holidays)
+
 def solve_bigm(scenario, bigm=10000, kind='CBC', time_limit=None, random_seed=None, ratio_gap=0.0, msg=0):
 	"""
 	Solves the given scenario using a bigm-type MIP
@@ -341,9 +361,6 @@ class DiscreteMIP(object):
 
 		x = dict()  # mip variables
 		cons = list()  # log of constraints for debugging
-		
-		ra_to_tasks = S.resources_req_tasks()
-		
 		for T in self.task_groups:
 			task_group_size = len(self.task_groups[T])
 			# base time-indexed variables
@@ -365,40 +382,29 @@ class DiscreteMIP(object):
 				x.update({ (T,R,t) : mip.var(str((T, R, t)), 0, task_group_size, cat)
 				           for R in RA for t in range(self.horizon) if (T,R,t) not in x})
 				# enough position needs to get selected
-				# affine = [(x[T, R, t], 1) for R in RA for t in range(self.horizon) ]
+				affine = [(x[T, R, t], 1) for R in RA for t in range(self.horizon) ]
 				# TODO: can the next line be removed?
 				# cons.append(mip.con(affine, sense=0, rhs=task_group_size))
 				# synchronize with base variables
 				for t in range(self.horizon):
 					affine = [(x[T, R, t], 1) for R in RA] + [(x[T,t],-1)]
 					cons.append(mip.con(affine, sense=0, rhs=0))
-				
-				# check if group requires the same resource
-				# if yes, introduce new variable (T,R)
-				if (len(set(ra_to_tasks[RA]) & set(self.task_groups[T])) == task_group_size):
-					# TODO: assume it's impossible that part of tasks require the same resource. OK?
-					for R in RA:
-						if (T,R) not in x:
-							x.update({(T,R) : mip.var(str((T, R)), 0, 1, 'Binary')})
-						affine = [(x[T, R, t], 1) for t in range(self.horizon) ] + [(x[T,R], -task_group_size)]
-						cons.append(mip.con(affine, sense=0, rhs=0))
 
 			# generate shortcuts for single resources
 			x.update({ (T,R,t) : x[T,t] for RA in T.resources_req if len(RA) == 1
 					   for R in RA for t in range(self.horizon) })
 
 		# synchronize in RA with multiple tasks
+		ra_to_tasks = S.resources_req_tasks()
 		for RA in ra_to_tasks:
 			tasks = list(set(ra_to_tasks[RA]) & set(self.task_groups))
 			if not tasks:
 				continue
-			T_ = tasks[0]
-			task_group_size_T_ = len(self.task_groups[T_])
 			for R in RA:
+				T_ = tasks[0]
 				for T in tasks[1:]:
-					task_group_size_T = len(self.task_groups[T])
-					affine = [(x[T,R,t],1/task_group_size_T) for t in range(self.horizon) ]+\
-							 [(x[T_,R,t],-1/task_group_size_T_) for t in range(self.horizon) ]
+					affine = [(x[T,R,t],1) for t in range(self.horizon) ]+\
+							 [(x[T_,R,t],-1) for t in range(self.horizon) ]
 					cons.append(mip.con(affine, sense=0, rhs=0))
 
 		# everybody is finished before the horizon TODO: why is this check necessary
@@ -433,7 +439,6 @@ class DiscreteMIP(object):
 				pulpmip.cons(affine, sense=-1, rhs= P.task_right.length-P.offset )
 			# TODO: add second constraints, they seem to help??
 			'''
-			'''
 			if P.offset >= 0:
 				for t in range(self.horizon):
 					affine = [(x[P.task_left, t_],1) for t_ in range(t,self.horizon)] + \
@@ -444,25 +449,6 @@ class DiscreteMIP(object):
 					affine = [(x[P.task_right, t_],1) for t_ in range(t)] + \
 						 [(x[P.task_left, t_],-1) for t_ in range(min(t+P.task_right.length-P.offset,self.horizon))]
 					cons.append(mip.con(affine, sense=-1, rhs=0))
-			'''
-			
-			# introduce a new variable (T, t, 'finished')
-			# which means task T (including all tasks in the same group) is finished at t or not
-			# 0: not yet    1: finished
-			# Example: T (T0 and T1) runs at [2,4] and [5,7]
-			# (T,t,'finished')=1 when t>=7, else 0
-			if (P.task_left, 0, 'finished') not in x:
-				for t in range(self.horizon):
-					x[(P.task_left, t, 'finished')] = mip.var(str((P.task_left, t, 'finished')), 0, 1, 'Binary')
-					task_group_size = len(self.task_groups[P.task_left])
-					affine = [(x[(P.task_left, t, 'finished')],1)] + [(x[P.task_left, t_],-1/task_group_size) for t_ in range(max(t-P.task_left.length+1,0))]
-					cons.append(mip.con(affine, sense=-1, rhs=0))
-					cons.append(mip.con(affine, sense=1, rhs=(-1+1/(task_group_size+1))))
-			
-			# if task_left is not finished, sum(task_right, t) must be 0 (considering offset)
-			for t in range(min(self.horizon-1-P.offset, self.horizon)):
-				affine = [(x[(P.task_right, t_)],1) for t_ in range(t+1+P.offset)] + [(x[(P.task_left, t, 'finished')],-len(self.task_groups[P.task_right]))]
-				cons.append(mip.con(affine, sense=-1, rhs=0))
 
 		# tight precedence constraints
 		for P in S.precs_tight():
@@ -478,7 +464,6 @@ class DiscreteMIP(object):
 					 [(x[P.task_right, t],-t) for t in range(self.horizon)]
 				pulpmip.cons(affine, sense=0, rhs= P.task_right.length-P.offset )
 			'''
-			'''
 			if P.offset >= 0:
 				for t in range(self.horizon):
 					affine = [(x[P.task_left, t_],1) for t_ in range(t,self.horizon)] + \
@@ -489,24 +474,6 @@ class DiscreteMIP(object):
 					affine = [(x[P.task_right, t_],1) for t_ in range(t)] + \
 						 [(x[P.task_left, t_],-1) for t_ in range(min(t+P.task_right.length-P.offset,self.horizon))]
 					cons.append(mip.con(affine, sense=0, rhs=0))
-			'''
-			
-			# similar to lax precedence
-			if (P.task_left, 0, 'finished') not in x:
-				for t in range(self.horizon):
-					x[(P.task_left, t, 'finished')] = mip.var(str((P.task_left, t, 'finished')), 0, 1, 'Binary')
-					task_group_size = len(self.task_groups[P.task_left])
-					affine = [(x[(P.task_left, t, 'finished')],1)] + [(x[P.task_left, t_],-1/task_group_size) for t_ in range(max(t-P.task_left.length+1,0))]
-					cons.append(mip.con(affine, sense=-1, rhs=0))
-					cons.append(mip.con(affine, sense=1, rhs=(-1+1/(task_group_size+1))))
-			
-			# if task_left is not finished, sum(task_right, t) must be 0 (considering offset)
-			# and task_right have to start immediately when task_left finished
-			for t in range(min(self.horizon-1-P.offset, self.horizon)):
-				affine = [(x[(P.task_right, t_)],1) for t_ in range(t+1+P.offset)] + [(x[(P.task_left, t, 'finished')],-len(self.task_groups[P.task_right]))]
-				cons.append(mip.con(affine, sense=-1, rhs=0))
-				affine = [(x[(P.task_right, t_)],1) for t_ in range(t+1+P.offset)] + [(x[(P.task_left, t, 'finished')],-1)]
-				cons.append(mip.con(affine, sense=1, rhs=0))
 
 		# low bounds
 		for P in S.bounds_low():
@@ -519,29 +486,22 @@ class DiscreteMIP(object):
 		for P in S.bounds_up():
 			if P.task not in self.task_groups:
 				continue
-			#affine = [(x[P.task, t],1) for t in range(P.bound,self.horizon)]
-			affine = [(x[P.task, t],1) for t in range(max(P.bound-P.task.length,0),self.horizon)]
+			affine = [(x[P.task, t],1) for t in range(max(P.bound-P.task.length+1,0),self.horizon)]
 			cons.append(mip.con(affine, sense=0, rhs=0))
 
 		# tight low bounds
 		for P in S.bounds_low_tight():
 			if P.task not in self.task_groups:
 				continue
-			#task_group_size = len(self.task_groups[P.task])
-			#cons.append(mip.con([(x[P.task, P.bound],1)], sense=0, rhs=task_group_size))
-			affine = [(x[P.task, t],1) for t in range(P.bound)]
-			cons.append(mip.con(affine, sense=0, rhs=0))
-			cons.append(mip.con([(x[P.task, P.bound],1)], sense=1, rhs=1))
+			task_group_size = len(self.task_groups[P.task])
+			cons.append(mip.con([(x[P.task, P.bound],1)], sense=0, rhs=task_group_size))
 
 		# tight up bounds
 		for P in S.bounds_up_tight():
 			if P.task not in self.task_groups:
 				continue
-			#task_group_size = len(self.task_groups[P.task])
-			#cons.append(mip.con([(x[P.task, max(P.bound-P.task.length,0)],1)], sense=0, rhs=task_group_size))
-			affine = [(x[P.task, t],1) for t in range(P.bound-P.task.length+1,self.horizon)]
-			cons.append(mip.con(affine, sense=0, rhs=0))
-			cons.append(mip.con([(x[P.task, max(P.bound-P.task.length,0)],1)], sense=1, rhs=1))
+			task_group_size = len(self.task_groups[P.task])
+			cons.append(mip.con([(x[P.task, max(P.bound-P.task.length,0)],1)], sense=0, rhs=task_group_size))
 
 		# conditional precedence constraints
 		for P in S.precs_cond():
@@ -698,7 +658,410 @@ class DiscreteMIP(object):
 			print('ERROR: no solution found')
 		return 0
 
+class DiscreteMIP2(object):
+	"""
+	pulp with time discretisation
+	version 2:
+		a. not use group
+		b. generate necessary (T,t) only (eg. t in [horizon-length, horizon] is useless)
+	"""
 
+	def __init__(self,mip):
+		self.mip = mip
+		self.scenario = None
+		self.horizon = None
+		self.x = None  # mip variables shortcut
+
+	def build_bound_constraints(self):
+		S = self.scenario
+		
+		# initialize start_range
+		for T in S.tasks():
+			if T.start_value is not None:
+				T.start_range = [T.start_value, T.start_value+1]
+			else:
+				T.start_range = [0, self.horizon-T.length+1]
+		
+		# low bounds
+		for P in S.bounds_low():
+			if P.task.start_range[0] < P.bound:
+				P.task.start_range[0] = P.bound
+
+		# up bounds
+		for P in S.bounds_up():
+			if P.task.start_range[1] > P.bound-P.task.length+1:
+				P.task.start_range[1] = P.bound-P.task.length+1
+
+		# tight low bounds
+		for P in S.bounds_low_tight():
+			if P.task.start_range[0] < P.bound:
+				P.task.start_range[0] = P.bound
+			if P.task.start_range[1] > P.bound+1:
+				P.task.start_range[1] = P.bound+1
+
+		# tight up bounds
+		for P in S.bounds_up_tight():
+			if P.task.start_range[0] < P.bound-P.task.length:
+				P.task.start_range[0] = P.bound-P.task.length
+			if P.task.start_range[1] > P.bound-P.task.length+1:
+				P.task.start_range[1] = P.bound-P.task.length+1
+		
+		# lax and tight precedence constraints
+		for P in S.precs_lax() + S.precs_tight():
+			if P.offset >= 0:
+				r_start = P.task_left.start_range[0] + P.task_left.length + P.offset
+				if P.task_right.start_range[0] < r_start:
+					P.task_right.start_range[0] = r_start
+				l_end = P.task_right.start_range[1] - P.task_left.length - P.offset
+				if P.task_left.start_range[1] > l_end:
+					P.task_left.start_range[1] = l_end
+
+		# tight precedence constraints only
+		for P in S.precs_tight():
+			if P.offset >= 0:
+				r_end = P.task_left.start_range[1] + P.task_left.length + P.offset
+				if P.task_right.start_range[1] > r_end:
+					P.task_right.start_range[1] = r_end
+		
+		# check
+		for T in S.tasks():
+			if T.start_range[0] >= T.start_range[1]:
+				return 0
+		
+		return 1
+		
+	def build_mip_from_scenario(self, msg=0):
+		S = self.scenario
+		mip = self.mip
+
+		x = dict()  # mip variables
+		#cons = list()  # log of constraints for debugging
+		for T in S.tasks():
+			# check if task is required, if not don't include it to calculate
+			if T.required != True:
+				continue
+			
+			#if T.start_value is not None:
+			#	s, e = T.start_value, T.start_value + 1
+			#elif 'start_range' in T:
+			#	s, e = T.start_range
+			#else:
+			#	s, e = 0, self.horizon - T.length + 1
+			s, e = T.start_range
+			
+			if self.holidays:
+				tRange = set(range(s, e)).difference(self.holidays)
+			else:
+				tRange = range(s, e)
+			
+			x.update({ (T,t) : mip.var(str((T, t))) for t in tRange})
+			affine = [(x[T, t], 1) for t in tRange]
+
+			mip.con(affine, sense=0, rhs=1)
+
+			# when resource is not fixed
+			if not T.resources:
+				for RA in T.resources_req:
+					# check if contains a single resource
+					if len(RA) < 2:
+						continue
+					# create variables if necessary except the first one
+					x.update({ (T,R,t) : mip.var(str((T, R, t)))
+							   for R in RA for t in tRange if (T,R,t) not in x})
+					# enough position needs to get selected
+					# TODO: can the next line be removed?
+					# cons.append(mip.con(affine, sense=0, rhs=task_group_size))
+					# synchronize with base variables
+					for t in tRange:
+						affine = [(x[T, R, t], 1) for R in RA] + [(x[T,t],-1)]
+						mip.con(affine, sense=0, rhs=0)
+
+				# generate shortcuts for single resources
+				x.update({ (T,R,t) : x[T,t] for RA in T.resources_req if len(RA) == 1
+						   for R in RA for t in tRange})
+			else:
+				# generate shortcuts for fixed resources
+				x.update({ (T,R,t) : x[T,t] for R in T.resources for t in tRange})
+
+		xKeySet = set(x.keys())
+		# synchronize in RA with multiple tasks
+		ra_to_tasks = S.resources_req_tasks()
+		for RA in ra_to_tasks:
+			tasks = [T for T in ra_to_tasks[RA] if T.required == True]
+			if len(tasks) <= 1:
+				continue
+			for R in RA:
+				T_ = tasks[0]
+				for T in tasks[1:]:
+					e1 = xKeySet.intersection([(T,R,t) for t in range(*T.start_range)])
+					e2 = xKeySet.intersection([(T_,R,t) for t in range(*T_.start_range)])
+					affine = [(x[k],1) for k in e1 ] + [(x[k],-1) for k in e2 ]
+					if affine:
+						mip.con(affine, sense=0, rhs=0)
+
+		# everybody is finished before the horizon TODO: why is this check necessary
+		#affine = [ (x[T, t],1) for T in S.tasks() for t in range(self.horizon-T.length+1,self.horizon) if (T,t) in x ]
+		#cons.append(mip.con(affine, sense=-1, rhs=0))
+
+		coeffs = { (T,R) : RA[R] for T in S.tasks() if T.required == True for RA in T.resources_req for R in RA }
+		for R in S.resources():
+			if R.size is not None:
+				resource_size = R.size
+			else:
+				resource_size = 1.0
+			Ts = set(S.tasks(resource=R)) #!!!!!!!!!! very important
+			for t in range(self.horizon):
+				e1 = xKeySet.intersection([(T,R,t_) for T in Ts for t_ in range(t+1-T.length,t+1)])
+				affine = [(x[(T,R,_t)], coeffs[T,R]) for (T,R,_t) in e1]
+				if affine:
+					mip.con(affine, sense=-1, rhs=resource_size)
+
+		# lax precedence constraints
+		for P in S.precs_lax():
+			'''
+			if P.offset >= 0:
+				affine = [(x[P.task_left, t],t) for t in range(self.horizon)] +\
+				         [(x[P.task_right, t],-t) for t in range(self.horizon)]
+				pulpmip.cons(affine, sense=-1, rhs=-(P.task_left.length + P.offset))
+			elif P.offset < 0:
+				affine = [(x[P.task_left, t],t) for t in range(self.horizon)] +\
+					     [(x[P.task_right, t],-t) for t in range(self.horizon)]
+				pulpmip.cons(affine, sense=-1, rhs= P.task_right.length-P.offset )
+			# TODO: add second constraints, they seem to help??
+			'''
+			if P.task_left.required != True or P.task_right.required != True:
+				continue
+			if P.offset >= 0:
+				for t in range(self.horizon):
+					e1 = xKeySet.intersection([(P.task_left, t_) for t_ in range(t,self.horizon)])
+					if not e1:
+						break
+					e2 = xKeySet.intersection([(P.task_right, t_) for t_ in range(min(t+P.task_left.length+P.offset,self.horizon),self.horizon)])
+					affine = [(x[k],1) for k in e1 ] + [(x[k],-1) for k in e2 ]
+					if affine:
+						mip.con(affine, sense=-1, rhs=0)
+			elif P.offset < 0:
+				# not support
+				for t in range(self.horizon):
+					affine = [(x[P.task_right, t_],1) for t_ in range(t) if (P.task_right, t_) in x] + \
+						 [(x[P.task_left, t_],-1) for t_ in range(min(t+P.task_right.length-P.offset,self.horizon)) \
+						 if (P.task_left, t_) in x]
+					if affine:
+						mip.con(affine, sense=-1, rhs=0)
+
+		# tight precedence constraints
+		for P in S.precs_tight():
+			'''
+			if P.offset >= 0:
+				affine = [(x[P.task_left, t],t) for t in range(self.horizon)] + \
+					 [(x[P.task_right, t],-t) for t in range(self.horizon)]
+				pulpmip.cons(affine, sense=0, rhs=-(P.task_left.length + P.offset))
+			elif P.offset < 0:
+				affine = [(x[P.task_left, t],t) for t in range(self.horizon)] +\
+					 [(x[P.task_right, t],-t) for t in range(self.horizon)]
+				pulpmip.cons(affine, sense=0, rhs= P.task_right.length-P.offset )
+			'''
+			if P.task_left.required != True or P.task_right.required != True:
+				continue
+			if P.offset >= 0:
+				for t in range(self.horizon):
+					e1 = xKeySet.intersection([(P.task_left, t_) for t_ in range(t,self.horizon)])
+					e2 = xKeySet.intersection([(P.task_right, t_) for t_ in range(min(t+P.task_left.length+P.offset,self.horizon),self.horizon)])
+					affine = [(x[k],1) for k in e1 ] + [(x[k],-1) for k in e2 ]
+					if affine:
+						mip.con(affine, sense=0, rhs=0)
+			elif P.offset < 0:
+				# not support
+				for t in range(self.horizon):
+					affine = [(x[P.task_right, t_],1) for t_ in range(t) if (P.task_right, t_) in x] + \
+						 [(x[P.task_left, t_],-1) for t_ in range(min(t+P.task_right.length-P.offset,self.horizon)) \
+						 if (P.task_left, t_) in x]
+					if affine:
+						mip.con(affine, sense=0, rhs=0)
+		'''
+		# low bounds
+		for P in S.bounds_low():
+			if P.task.required != True:
+				continue
+			e1 = xKeySet.intersection([(P.task, t_) for t_ in range(P.bound)])
+			affine = [(x[k],1) for k in e1 ]
+			if affine:
+				mip.con(affine, sense=0, rhs=0)
+
+		# up bounds
+		for P in S.bounds_up():
+			if P.task.required != True:
+				continue
+			e1 = xKeySet.intersection([(P.task, t_) for t_ in range(max(P.bound-P.task.length+1,0),self.horizon)])
+			affine = [(x[k],1) for k in e1 ]
+			if affine:
+				mip.con(affine, sense=0, rhs=0)
+
+		# tight low bounds
+		for P in S.bounds_low_tight():
+			if P.task.required != True:
+				continue
+			if (P.task, P.bound) in x:
+				affine = [(x[P.task, P.bound],1)]
+			else:
+				affine = [] #error -> no solution
+			mip.con(affine, sense=0, rhs=1)
+
+		# tight up bounds
+		for P in S.bounds_up_tight():
+			if P.task.required != True:
+				continue
+			if (P.task, max(P.bound-P.task.length,0)) in x:
+				affine = [(x[P.task, max(P.bound-P.task.length,0)],1)]
+			else:
+				affine = [] #error -> no solution
+			mip.con(affine, sense=0, rhs=1)
+		'''
+
+		'''
+		# conditional precedence constraints
+		for P in S.precs_cond():
+			if P.task_left not in self.task_groups or P.task_right not in self.task_groups:
+				continue
+			shared_resources = list(set(S.resources(task=P.task_left)) & set(S.resources(task=P.task_right)))
+			for R in shared_resources:
+				for t in range(self.horizon):
+					affine = [(x[P.task_left, R, t], 1)] +\
+					         [(x[P.task_right, R, t_],1)
+					          for t_ in range(t,min(t+P.task_left.length+P.offset,self.horizon))]
+					rhs = (len(self.task_groups[P.task_left])+len(self.task_groups[P.task_right])/2.0)
+					cons.append(mip.con(affine, sense=-1, rhs=rhs))
+		'''
+
+		# capacity lower bounds
+		for C in S.capacity_low():
+			# weight gets proportionally assigned according to overlap
+			affine = [ (x[T, C.resource, t_], C.weight(T=T,t=t)/float(T.length) )
+					  for t in range(self.horizon)
+					  for T in S.tasks() if T.required == True
+					  for t_ in range(max(0,t-T.length+1),t+1)
+					  if (T,C.resource,t_) in x and C.weight(T=T,t=t) ]
+			'''
+			affine = [ (x[T, C.resource, t], C.weight(T=T,t=t)) for T in self.task_groups
+					  for t in range(self.horizon) if (T,C.resource,t) in x and C.weight(T=T,t=t) ]
+			'''
+			if not affine:
+				continue
+			# sum up (pulp doesnt do this)
+			affine_ = { a:0 for a,b in affine }
+			for a,b in affine:
+				affine_[a] += b
+			affine = [ (a,affine_[a]) for a in affine_ ]
+			mip.con(affine, sense=1, rhs=C.bound)
+
+		# capacity upper bounds
+		for C in S.capacity_up():
+			# weight gets proportionally assigned according to overlap
+			affine = [ (x[T, C.resource, t_], C.weight(T=T,t=t)/float(T.length) )
+					  for t in range(self.horizon)
+					  for T in S.tasks() if T.required == True
+					  for t_ in range(max(0,t-T.length+1),t+1)
+					  if (T,C.resource,t_) in x and C.weight(T=T,t=t) ]
+			'''
+			affine = [ (x[T, C.resource, t], C.weight(T=T,t=t)) for T in self.task_groups
+					  for t in range(self.horizon) if (T,C.resource,t) in x and C.weight(T=T,t=t) ]
+			'''
+			if not affine:
+				continue
+			# sum up (pulp doesnt do this)
+			affine_ = { a:0 for a,b in affine }
+			for a,b in affine:
+				affine_[a] += b
+			affine = [ (a,affine_[a]) for a in affine_ ]
+			mip.con(affine, sense=-1, rhs=C.bound)
+
+		# capacity switch bounds
+		# not used for wbs
+		count = 0
+		for C in S.capacity_diff_up():
+			R = C.resource
+			# get affected periods
+			periods = list(set([ t for t in range(self.horizon) for T in S.tasks() if C.weight(T,t) ]))
+			periods = sorted(periods)
+			x.update({ ('switch_%i'%count,R,t) : mip.var(str(('switch_%i'%count,R, t)), 0, 1)
+			           for t in periods })
+			# define switch variables
+			for t in periods[:-1]:
+				# decrease switch
+				if C.kind == 'diff' or C.kind == 'diff_dec':
+					affine = [ (x['switch_%i'%count,R,t],1) ] +\
+							 [ (x[T,R,t-T.length+1],-1) for T in S.tasks
+							   if (T,R,t-T.length+1) in x and C.weight(T,t) ] +\
+							 [ (x[T,R,t+1],1) for T in S.tasks()
+							   if (T,R,t+1) in x and C.weight(T,t+1) ]
+					mip.con(affine, sense=1, rhs=0)
+				# increase switch
+				if C.kind == 'diff' or C.kind == 'diff_inc':
+					affine = [ (x['switch_%i'%count,R,t],1) ] +\
+							 [ (x[T,R,t-T.length+1],1) for T in S.tasks
+							   if (T,R,t-T.length+1) in x and C.weight(T,t) ] +\
+							 [ (x[T,R,t+1],-1) for T in S.tasks()
+							   if (T,R,t+1) in x and C.weight(T,t+1) ]
+					mip.con(affine, sense=1, rhs=0)
+			affine = [ (x['switch_%i'%count,R,t],1) for t in periods[:-1] if ('switch_%i'%count,R,t) in x ]
+			mip.con(affine, sense=-1, rhs=C.bound)
+			count += 1
+
+		# objective
+		affine = [(x[T, t], T.completion_time_cost*t) for T in S.tasks() if 'completion_time_cost' in T \
+					for t in range(self.horizon) if (T,t) in x]
+		mip.obj(affine)
+		'''
+		for con in cons:
+			mip.add_con(con)
+		'''
+		self.mip = mip
+		self.x = x
+
+
+	def read_solution_from_mip(self, msg=0):
+
+		for T in self.scenario.tasks():
+			if T.required != True:
+				continue
+			T.start_value = [t for t in range(self.horizon) if (T,t) in self.x and int(self.mip.value(self.x[(T,t)])) == 1][0]
+			T.resources = [R for RA in T.resources_req for R in RA if (T,R,T.start_value) in self.x \
+							and int(self.mip.value(self.x[(T,R,T.start_value)])) == 1]
+
+	def solve(self, scenario, kind='CBC', time_limit=None, random_seed=None, ratio_gap=0.0, msg=0, holidays=None):
+
+		self.scenario = scenario
+		if self.scenario.horizon is None:
+			raise Exception('ERROR: solver requires scenarios with defined horizon')
+			return 0
+
+		self.horizon = self.scenario.horizon
+		self.holidays = holidays
+		if self.build_bound_constraints() == 0:
+			return 0
+		self.build_mip_from_scenario(msg=msg)
+
+		# if time_limit :
+		#	options += ['sec',str(time_limit),'ratioGap',str(0.1),'cuts','off',
+                #       'heur','on','preprocess','on','feas','on']#,'maxNodes',str(0),'feas','both','doh','solve']
+
+		params = dict()
+		if time_limit is not None:
+			params['time_limit'] = time_limit
+		if random_seed is not None:
+			params['random_seed'] = str(random_seed)
+		#params['cuts'] = 'off'
+		params['ratio_gap'] = str(ratio_gap)
+		params['kind'] = kind
+		self.mip.solve(msg=msg,**params)
+		#_solve_mip(self.mip, kind=kind, params=params, msg=msg)
+
+		if self.mip.status() == 1:
+			self.read_solution_from_mip(msg=msg)
+			return 1
+		if msg:
+			print('ERROR: no solution found')
+		return 0
 
 
 
